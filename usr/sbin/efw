@@ -1,25 +1,5 @@
 #!/bin/bash
 
-add_rules_general() 
-{
-	if [ "$2" != "reject" ]; then
-		nft add chain inet efw $1 { type filter hook $1 priority 0 \; policy "$2" \; }
-	else
-		nft add chain inet efw $1 { type filter hook $1 priority 0 \; policy drop \; }
-		nft add rule inet efw $1 jump handle_reject
-	fi
-
-	nft add rule inet efw $1 ct state related,established accept
-
-	if [ "$1" == "input" ]; then
-		nft add rule inet efw $1 iif "lo" accept comment \"Accept any localhost traffic\"
-		nft add rule inet efw $1 iif != "lo" ip daddr 127.0.0.0/8 counter drop comment \"drop connections to loopback not coming from loopback\"
-	elif [ "$1" == "output" ]; then
-		nft add rule inet efw $1 oif "lo" accept comment \"Accept any localhost traffic\"
-		nft add rule inet efw $1 oif != "lo" ip daddr 127.0.0.0/8 counter drop comment \"drop connections to loopback not coming from loopback\"
-	fi
-}
-
 add_rules_forward() {
 	forwards_count=$(uci_get_count firewall forwards)
 	
@@ -41,24 +21,24 @@ add_rules_forward() {
 		if [ "$proto" == "tcp udp" -o "$proto" == "tcp"  -o "$proto" == "udp"  -o "$proto" == "stcp" ]; then
 			if [ "$proto" == "tcp udp" ]; then
 				if [ -n "$dest_ip" ]; then
-					nft add rule inet efw prerouting meta nfproto ipv4 tcp dport $src_port dnat ip to $dest_ip:$dest_port
-					nft add rule inet efw prerouting meta nfproto ipv4 udp dport $src_port dnat ip to $dest_ip:$dest_port
+					iptables -t nat -A PREROUTING -p tcp --dport $src_port -j DNAT --to-destination $dest_ip:$dest_port
+					iptables -t nat -A PREROUTING -p udp --dport $src_port -j DNAT --to-destination $dest_ip:$dest_port
 				else
-					nft add rule inet efw prerouting meta nfproto ipv4 tcp dport $src_port redirect to :$dest_port
-					nft add rule inet efw prerouting meta nfproto ipv4 udp dport $src_port redirect to :$dest_port
+					iptables -t nat -A PREROUTING -p tcp --dport $src_port -j REDIRECT --to-port $dest_port
+					iptables -t nat -A PREROUTING -p udp --dport $src_port -j REDIRECT --to-port $dest_port
 				fi
 			else
 				if [ -n "$dest_ip" ]; then
-					nft add rule inet efw prerouting meta nfproto ipv4 $proto dport $src_port dnat ip to $dest_ip:$dest_port
+					iptables -t nat -A PREROUTING -p $proto --dport $src_port -j DNAT --to-destination $dest_ip:$dest_port
 				else
-					nft add rule inet efw prerouting meta nfproto ipv4 $proto dport $src_port redirect to :$dest_port
+					iptables -t nat -A PREROUTING -p $proto --dport $src_port -j REDIRECT --to-port $dest_port
 				fi
 			fi
 		else
 			if [ "$proto" == "any" ]; then
-				nft add rule inet efw prerouting meta nfproto ipv4 dnat ip to $dest_ip 
+				iptables -t nat -A PREROUTING -j DNAT --to-destination $dest_ip
 			else
-				nft add rule inet efw prerouting meta l4proto $proto dnat ip to $dest_ip
+				iptables -t nat -A PREROUTING -p $proto -j DNAT --to-destination $dest_ip
 			fi
 		fi
 	done
@@ -78,142 +58,101 @@ add_rules_traffic() {
 			continue
 		fi
 		proto=$(uci get firewall.@traffic[$count].proto)
-		rule=$(uci get firewall.@traffic[$count].rule)
+		rule=$(uci get firewall.@traffic[$count].rule | tr 'a-z' 'A-Z')
 		src_mac=$(uci get firewall.@traffic[$count].src_mac)
 		src_ip=$(uci get firewall.@traffic[$count].src_ip)
 		src_port=$(uci get firewall.@traffic[$count].src_port)
 		dest_ip=$(uci get firewall.@traffic[$count].dest_ip)
 		dest_port=$(uci get firewall.@traffic[$count].dest_port)
-		action=$(uci get firewall.@traffic[$count].action)
+		action=$(uci get firewall.@traffic[$count].action | tr 'a-z' 'A-Z')
 		name=$(uci get firewall.@traffic[$count].name)
 
 		if [ -n "$src_ip" ]; then
-			saddr="ip saddr $src_ip"
+			saddr="-s $src_ip"
 		fi
 
 		if [ -n "$dest_ip" ]; then
-			daddr="ip daddr $dest_ip"
+			daddr="-d $dest_ip"
 		fi
 
 		if [ -n "$src_mac" ]; then
-			smac="ether saddr $src_mac"
+			smac="--mac-source $src_mac"
 		fi
+
+		if [ -n "$src_port" ]; then
+			sport="--sport $src_port"
+		fi
+
+		if [ -n "$dest_port" ]; then
+			dport="--dport $dest_port"
+		fi
+
 		
 		if [ "$proto" == "tcp udp" -o "$proto" == "tcp"  -o "$proto" == "udp"  -o "$proto" == "stcp" ]; then
 			if [ "$proto" == "tcp udp" ]; then
-				local tcp_sport udp_sport tcp_dport udp_dport
-
-				if [ -n "$src_port" ]; then
-					tcp_sport="tcp sport $src_port"
-					udp_sport="udp sport $src_port"
-				fi
-
-				if [ -n "$dest_port" ]; then
-					tcp_dport="tcp dport $dest_port"
-					udp_dport="udp dport $dest_port"
-				fi
-
-				if [ "$action" == "reject" ]; then
-					if [ ! -n "$dport" ] && [ ! -n "$sport" ]; then
-						nft add rule inet efw $rule meta l4proto tcp $saddr $daddr $smac counter jump handle_reject comment "efw-$name"
-						nft add rule inet efw $rule meta l4proto udp $saddr $daddr $smac counter jump handle_reject comment "efw-$name"
-					else
-						nft add rule inet efw $rule $saddr $daddr $tcp_sport $tcp_dport $smac counter jump handle_reject comment "efw-$name"
-						nft add rule inet efw $rule $saddr $daddr $udp_sport $udp_dport $smac counter jump handle_reject comment "efw-$name"
-					fi
-				else
-					if [ ! -n "$dport" ] && [ ! -n "$sport" ]; then
-						nft add rule inet efw $rule meta l4proto tcp $saddr $daddr $smac counter $action comment "efw-$name"
-						nft add rule inet efw $rule meta l4proto udp $saddr $daddr $smac counter $action comment "efw-$name"
-					else
-						nft add rule inet efw $rule $saddr $daddr $tcp_sport $tcp_dport $smac counter $action comment "efw-$name"
-						nft add rule inet efw $rule $saddr $daddr $udp_sport $udp_dport $smac counter $action comment "efw-$name"	
-					fi
-				fi
+				iptables -t filter -A $rule -p tcp $saddr $daddr $sport $dport $smac -j $action -m comment --comment "efw-$name"
+				iptables -t filter -A $rule -p udp $saddr $daddr $sport $dport $smac -j $action -m comment --comment "efw-$name"
 			else
-				if [ -n "$src_port" ]; then
-					sport="$proto sport $src_port"
-				fi
-
-				if [ -n "$dest_port" ]; then
-					dport="$proto dport $dest_port"
-				fi
-
-				if [ "$action" == "reject" ]; then
-					if [ ! -n "$dport" ] && [ ! -n "$sport" ]; then
-						nft add rule inet efw $rule meta l4proto $proto $saddr $daddr $smac counter jump handle_reject comment "efw-$name"
-					else 
-						nft add rule inet efw $rule $saddr $daddr $sport $dport $smac counter jump handle_reject comment "efw-$name"
-					fi
-				else
-					if [ ! -n "$dport" ] && [ ! -n "$sport" ]; then
-						nft add rule inet efw $rule meta l4proto $proto $saddr $daddr $smac counter $action comment "efw-$name"
-					else
-						nft add rule inet efw $rule $saddr $daddr $sport $dport $smac counter $action comment "efw-$name"
-					fi
-				fi
+				iptables -t filter -A $rule -p $proto $saddr $daddr $sport $dport $smac -j $action -m comment --comment "efw-$name"
 			fi
 		else
 			if [ "$proto" == "any" ]; then
-				nft add rule inet efw $rule counter accept comment "efw-$name"
+				iptables -t filter -A $rule -j $action -m comment --comment "efw-$name"
 			else
-				if [ "$action" == "reject" ]; then
-					nft add rule inet efw $rule meta l4proto $proto $smac counter jump handle_reject comment "efw-$name"
-				else
-					nft add rule inet efw $rule meta l4proto $proto $smac counter $action comment "efw-$name"
-				fi	
+				iptables -t filter -A $rule -p $proto $smac -j $action -m comment --comment "efw-$name"
 			fi
 		fi
 	done
 }
 
 add_rules() {
-	nft add table inet efw
-
-	nft add chain inet efw handle_reject
-	nft add rule inet efw handle_reject meta l4proto tcp reject with tcp reset
-	nft add rule inet efw handle_reject reject
-
-	input=$(uci get firewall.general.input)
-	output=$(uci get firewall.general.output)
-	forward=$(uci get firewall.general.forward)
-	add_rules_general input $input
-	add_rules_general output $output
-	add_rules_general forward $forward
-
+	input=$(uci get firewall.general.input | tr 'a-z' 'A-Z')
+	output=$(uci get firewall.general.output | tr 'a-z' 'A-Z')
+	forward=$(uci get firewall.general.forward | tr 'a-z' 'A-Z')
 	synflood_protect=$(uci get firewall.general.synflood_protect)
 	drop_invalid=$(uci get firewall.general.drop_invalid)
+
+	iptables -A INPUT -i lo -j ACCEPT
+	iptables -A OUTPUT -o lo -j ACCEPT
+	iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+	add_rules_forward
+	add_rules_traffic
+
+	iptables -A INPUT -i br0 -j ACCEPT
+	iptables -A OUTPUT -o br0 -j ACCEPT
+	iptables -A FORWARD -i br0 -j ACCEPT
+	iptables -A INPUT -j $input
+	iptables -A OUTPUT -j $output
+	iptables -A FORWARD -j $forward
+	
+
+	iptables -t nat -A POSTROUTING -j MASQUERADE
+
+	src_addr=$(ip route | grep br0 | awk -F ' ' '{print $1}')
+	iptables -t nat -A POSTROUTING -s $src_addr ! -d $src_addr -j MASQUERADE
 	
 	if [ "$synflood_protect" == "1" ]; then
-        nft add chain inet efw syn_flood
-		nft add rule inet efw syn_flood limit rate 25/second burst 50 packets return
-        nft add rule inet efw syn_flood drop
+		iptables -A INPUT -p tcp --syn -m limit --limit 5/s --limit-burst 10 -j ACCEPT
 	fi
 	
 	if [ "$drop_invalid" == "1" ]; then
-		nft add rule inet efw input ct state invalid drop
+		iptables -A INPUT -m state --state INVALID -j DROP
+		iptables -A FORWARD -m state --state INVALID -j DROP
+		iptables -A OUTPUT -m state --state INVALID -j DROP
 	fi
-	
-	nft -- add chain inet efw prerouting { type nat hook prerouting priority -100 \; }
-	nft add chain inet efw postrouting { type nat hook postrouting priority 100 \; }
-	add_rules_forward
+}
 
-	#nft add table ip filter
-	# nft add chain inet efw input_wan
-	# nft add chain inet efw input_lan
-	# nft add rule inet efw input_lan ct status dnat accept
-	# nft add rule inet efw input_lan iif "br0" counter accept
-	# nft add rule inet efw input iif "eth0" jump input_wan comment "Handle wan IPv4/IPv6 input traffic"
-
-	# nft add chain inet efw output_wan
-	# nft add chain inet efw output_lan 
-	# nft add rule inet efw output_lan oifname "br0" counter accept
-	# nft add rule inet efw output oif "eth0" jump output_wan comment "Handle wan IPv4/IPv6 out traffic"
-
-	add_rules_traffic
+reset_iptables() {
+	iptables -F
+	iptables -t nat -F
+	iptables -P INPUT ACCEPT
+	iptables -P FORWARD ACCEPT
+	iptables -P OUTPUT ACCEPT
 }
 
 start() {
+	echo "Start firewall"
     case "$1" in
         start | reload)
             add_rules
@@ -222,18 +161,13 @@ start() {
 }
 
 stop() {
-    if nft list tables inet | grep -sq "table inet efw"; then
-        nft delete table inet efw
-    else
-        return 1
-	fi
+	echo "Stop firewall"
+	reset_iptables
 }
 
 flush() {
-    local dummy family table
-    nft list tables | while read dummy family table; do
-        nft delete table "$family" "$table"
-    done
+	echo "Flush firewall"
+	reset_iptables
 }
 
 case "$1" in
